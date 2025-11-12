@@ -1,3 +1,7 @@
+"""
+Generative Auto-Bidding with Value-Guided Explorations
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,14 +11,22 @@ from gin import current_scope_str
 
 
 def getScore(budget, cpa_cons, states, all_reward):
-    beta = 2
-    curr_cost = budget * (1 - states[1])
+    '''
+    计算当前时刻的 带惩罚的score S_t (Eq.14)
+    score是为了计算 r_t (return-to-go)的: r_t = S_T - S_{t-1}
+
+    budget: 总预算
+    states[1]: 预算剩余比例
+    cpa_cons: 广告主对CPA的约束
+    '''
+    gamma = 2
+    curr_cost = budget * (1 - states[1])    # 已花预算 = 总预算 * (1-剩余比例)
     curr_all_reward = all_reward
-    curr_cpa = curr_cost / (curr_all_reward + 1e-10)
-    curr_coef = cpa_cons / (curr_cpa + 1e-10)
-    curr_penalty = pow(curr_coef, beta)
+    curr_cpa = curr_cost / (curr_all_reward + 1e-10)    # 当前CPA
+    curr_coef = cpa_cons / (curr_cpa + 1e-10)   #
+    curr_penalty = pow(curr_coef, gamma)    # 惩罚系数
     curr_penalty = 1.0 if curr_penalty > 1.0 else curr_coef
-    curr_score = curr_penalty * curr_all_reward
+    curr_score = curr_penalty * curr_all_reward      # 带惩罚的 score
 
     return curr_score
 
@@ -27,6 +39,7 @@ class CausalSelfAttention(nn.Module):
         self.value = nn.Linear(config['n_embd'], config['n_embd'])
         self.attn_drop = nn.Dropout(config['attn_pdrop'])
         self.resid_drop = nn.Dropout(config['resid_pdrop'])
+        # 下三角 mask，保证因果性
         self.register_buffer("bias",
                              torch.tril(torch.ones(config['n_ctx'], config['n_ctx'])).view(1, 1, config['n_ctx'],
                                                                                            config['n_ctx']))
@@ -36,19 +49,19 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config['n_head']
 
     def forward(self, x, mask):
-        B, T, C = x.size()
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        B, T, C = x.size()      # batch, seq_len, dim
+        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)   # (B, n_head, T, head_dim)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_head, T, head_dim)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_head, T, head_dim)
 
         mask = mask.view(B, -1)
-        mask = mask[:, None, None, :]
-        mask = (1.0 - mask) * -10000.0
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = torch.where(self.bias[:, :, :T, :T].bool(), att, self.masked_bias.to(att.dtype))
+        mask = mask[:, None, None, :]   # 变成(B,1,1,T)方便广播
+        mask = (1.0 - mask) * -10000.0      # -10000相当于-inf
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, n_head, T, T)
+        att = torch.where(self.bias[:, :, :T, :T].bool(), att, self.masked_bias.to(att.dtype))  # 应用下三角mask
         att = att + mask
         att = F.softmax(att, dim=-1)
-        self._attn_map = att.clone()
+        self._attn_map = att.clone()    # 可视化用
         att = self.attn_drop(att)
         y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -57,6 +70,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class Block(nn.Module):
+    # 解码器层： Attn+FFN
     def __init__(self, config):
         super().__init__()
         self.ln1 = nn.LayerNorm(config['n_embd'])
@@ -109,24 +123,34 @@ class GAVE(nn.Module):
         self.weight_decay = weight_decay
         self.learning_rate = learning_rate
         self.time_dim = time_dim
-        self.expectile = expectile
+        self.expectile = expectile      # 分位数的 τ
+
         block_config = block_config
+
+        # Transformer骨干
         self.transformer = nn.ModuleList([Block(block_config) for _ in range(block_config['n_layer'])])
-        self.embed_timestep = nn.Embedding(self.max_ep_len, self.time_dim)
-        self.embed_return = torch.nn.Linear(1, self.hidden_size)
-        self.embed_reward = torch.nn.Linear(1, self.hidden_size)
-        self.embed_state = torch.nn.Linear(self.state_dim, self.hidden_size)
-        self.embed_action = torch.nn.Linear(self.act_dim, self.hidden_size)
+
+        # PE
+        self.embed_timestep = nn.Embedding(self.max_ep_len, self.time_dim)      # 位置t的emb层
+        # 嵌入层
+        self.embed_return = torch.nn.Linear(1, self.hidden_size)    # r_t（return-to-go）的Embedding层，标量→向量
+        self.embed_reward = torch.nn.Linear(1, self.hidden_size)    # rw_t (r_t就是rw_t的return-to-go)，标量→向量
+        self.embed_state = torch.nn.Linear(self.state_dim, self.hidden_size)    # s的Embedding层
+        self.embed_action = torch.nn.Linear(self.act_dim, self.hidden_size)     # a的Embedding层
+        # 加入PE, 映射后 r, rw, s, a 都是 hidden_size
         self.trans_return = torch.nn.Linear(self.time_dim+self.hidden_size, self.hidden_size)
         self.trans_reward = torch.nn.Linear(self.time_dim+self.hidden_size, self.hidden_size)
         self.trans_state = torch.nn.Linear(self.time_dim+self.hidden_size, self.hidden_size)
         self.trans_action = torch.nn.Linear(self.time_dim+self.hidden_size, self.hidden_size)
+        # layernorm
         self.embed_ln = nn.LayerNorm(self.hidden_size)
-        self.predict_state = torch.nn.Linear(self.hidden_size, self.state_dim)
-        self.predict_action = nn.Sequential(
+
+        # 预测头
+        self.predict_state = torch.nn.Linear(self.hidden_size, self.state_dim)      # 下一状态（可选）
+        self.predict_action = nn.Sequential(        # â_t
             *([nn.Linear(self.hidden_size, self.act_dim)] + ([nn.Tanh()] if action_tanh else []))
         )
-        self.predict_beta = nn.Sequential(
+        self.predict_beta = nn.Sequential(      # β_t
             nn.Linear(self.hidden_size, 16),
             nn.GELU(),
             nn.Linear(16, 8),
@@ -135,7 +159,7 @@ class GAVE(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.predict_return = nn.Sequential(
+        self.predict_return = nn.Sequential(     # r_{t+1}   
             nn.Linear(self.hidden_size, 128),
             nn.GELU(),
             nn.Linear(128, 16),
@@ -143,7 +167,7 @@ class GAVE(nn.Module):
             nn.Linear(16, 1),
         )
 
-        self.predict_value = nn.Sequential(
+        self.predict_value = nn.Sequential(     # V_{t+1}
             nn.Linear(self.hidden_size, 128),
             nn.GELU(),
             nn.Linear(128, 16),

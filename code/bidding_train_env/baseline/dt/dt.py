@@ -137,7 +137,7 @@ class GAVE(nn.Module):
         self.embed_reward = torch.nn.Linear(1, self.hidden_size)    # rw_t (r_t就是rw_t的return-to-go)，标量→向量
         self.embed_state = torch.nn.Linear(self.state_dim, self.hidden_size)    # s的Embedding层
         self.embed_action = torch.nn.Linear(self.act_dim, self.hidden_size)     # a的Embedding层
-        # 加入PE, 映射后 r, rw, s, a 都是 hidden_size
+        # 用于加入PE的嵌入层, 映射后 r, rw, s, a 维度都是 hidden_size
         self.trans_return = torch.nn.Linear(self.time_dim+self.hidden_size, self.hidden_size)
         self.trans_reward = torch.nn.Linear(self.time_dim+self.hidden_size, self.hidden_size)
         self.trans_state = torch.nn.Linear(self.time_dim+self.hidden_size, self.hidden_size)
@@ -146,11 +146,14 @@ class GAVE(nn.Module):
         self.embed_ln = nn.LayerNorm(self.hidden_size)
 
         # 预测头
-        self.predict_state = torch.nn.Linear(self.hidden_size, self.state_dim)      # 下一状态（可选）
-        self.predict_action = nn.Sequential(        # â_t
-            *([nn.Linear(self.hidden_size, self.act_dim)] + ([nn.Tanh()] if action_tanh else []))
-        )
-        self.predict_beta = nn.Sequential(      # β_t
+        self.predict_state = torch.nn.Linear(self.hidden_size, self.state_dim)      # 下一状态（可选），GAVE未使用ŝ_{t+1}
+        
+        layers = [nn.Linear(self.hidden_size, self.act_dim)]
+        if action_tanh:
+            layers.append(nn.Tanh())
+        self.predict_action = nn.Sequential(*layers)     # â_t的映射，hidden_size -> act_dim
+
+        self.predict_beta = nn.Sequential(      # β_t的映射，hidden_size -> 1
             nn.Linear(self.hidden_size, 16),
             nn.GELU(),
             nn.Linear(16, 8),
@@ -159,7 +162,7 @@ class GAVE(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.predict_return = nn.Sequential(     # r_{t+1}   
+        self.predict_return = nn.Sequential(     # r̂_{t+1}的映射，hidden_size -> 1
             nn.Linear(self.hidden_size, 128),
             nn.GELU(),
             nn.Linear(128, 16),
@@ -167,7 +170,7 @@ class GAVE(nn.Module):
             nn.Linear(16, 1),
         )
 
-        self.predict_value = nn.Sequential(     # V_{t+1}
+        self.predict_value = nn.Sequential(     # V̂_{t+1}的映射，hidden_size -> 1
             nn.Linear(self.hidden_size, 128),
             nn.GELU(),
             nn.Linear(128, 16),
@@ -198,20 +201,39 @@ class GAVE(nn.Module):
         action_embeddings = self.trans_action(action_embeddings)
         returns_embeddings = self.trans_return(returns_embeddings)
         rewards_embeddings = self.trans_reward(rewards_embeddings)
+
+        '''
+        嵌入向量的堆叠顺序:
+        # stack得到 (B, 3, T, d)
+        # permute后变为(B, T, 3, d), 再reshape成(B, 3T, d)
+        # 即：[r₀, s₀, a₀,  r₁, s₁, a₁,  ...,  r_T, s_T, a_T]
+        '''
         stacked_inputs = torch.stack(
-            (returns_embeddings, state_embeddings, action_embeddings), dim=1
-        ).permute(0, 2, 1, 3).reshape(batch_size, 3 * seq_length, self.hidden_size)
+            (returns_embeddings,    # 0
+             state_embeddings,      # 1
+             action_embeddings),    # 2
+             dim=1    
+        ).permute(0, 2, 1, 3).reshape(batch_size, 3 * seq_length, self.hidden_size) 
+
         stacked_inputs = self.embed_ln(stacked_inputs)
         stacked_attention_mask = torch.stack(
             ([attention_mask for _ in range(self.length_times)]), dim=1
         ).permute(0, 2, 1).reshape(batch_size, self.length_times * seq_length).to(stacked_inputs.dtype)
         x = stacked_inputs
         for block in self.transformer:
-            x = block(x, stacked_attention_mask)
+            x = block(x, stacked_attention_mask)        # 经过transformer后输出为(B, 3T, d)
+        
+        # 经过reshape后 -> (B, T, 3, d)
+        # permute -> (B, 3, T, d)
         x = x.reshape(-1, seq_length, self.length_times, self.hidden_size).permute(0, 2, 1, 3)
+
+        # 那么 x[:, 0, :, :] → return 位隐向量 h^r
+        # x[:, 1, :, :] → state 位隐向量 h^s
+        # x[:, 2, :, :] → action 位隐向量 h^a
         return_preds = self.predict_return(x[:, 2])
         state_preds = self.predict_state(x[:, 2])
         action_preds = self.predict_action(x[:, 1])
+        
         if self.training:
             value_preds = self.predict_value(x[:, 1])
             beta_preds = self.predict_beta(x[:, 1]) + 0.5

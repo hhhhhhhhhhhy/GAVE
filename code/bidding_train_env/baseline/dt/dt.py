@@ -255,8 +255,8 @@ class GAVE(nn.Module):
 
         if self.training:
             # ⑧ 探索动作 ã_t = β_t · a_t（论文 β_t）
-            value_preds = self.predict_value(x[:, 1])       # V̂_{t+1}
-            beta_preds = self.predict_beta(x[:, 1]) + 0.    # β_t ∈ (0.5, 1.5)
+            value_preds = self.predict_value(x[:, 1])       # 用st及以前的信息(..., Rt, st) 去预测V̂_{t+1}
+            beta_preds = self.predict_beta(x[:, 1]) + 0.    # 用st及以前的信息(..., Rt, st) 去预测β_t ∈ (0.5, 1.5)
             actions_1 = actions.clone().detach() * beta_preds   # ã_t
             # 给 ã_t 做 emb（emb + PE + emb）
             action_embeddings_1 = self.embed_action(actions_1)
@@ -329,26 +329,44 @@ class GAVE(nn.Module):
         return action_preds[0, -1]  # 维度 (action_dim,)
 
     def step(self, states, actions, rewards, dones, all_reward, curr_score, timesteps, attention_mask, next_states):
-        action_target, curr_score_target = torch.clone(actions).detach(), torch.clone(curr_score).detach()
-        state_target = torch.clone(next_states).detach()
-        curr_score_target = curr_score_target[:, 1:]
-        state_preds, action_preds, curr_score_preds, reward_preds, curr_score_preds_1, action_1, value_preds = self.forward(
+        """
+        训练阶段一次 update 的完整 loss 计算：
+        1. 先 forward 拿到 â_t、β_t、V̂_{t+1}、r̂_{t+1}(a_t)、r̂_{t+1}(ã_t)
+        2. 构造 4 项 loss（动作回归 + RTG 回归 + expectile + OOD 正则）
+        3. 梯度更新
+        返回：总 loss + 各子 loss + 监控量
+        """
+
+        # ① 构造真值标签（detach 避免梯度回传）
+        action_target, curr_score_target = torch.clone(actions).detach(), torch.clone(curr_score).detach()      # a_t, R_t
+        state_target = torch.clone(next_states).detach()        # s_{t+1}
+        curr_score_target = curr_score_target[:, 1:]        # R_t 标签往后错一位 → score_{t+1}（用于 r̂_{t+1} 回归）
+
+        # forward一次，拿到预测的s^_t, â_t、r̂_{t+1}(a_t)、r̂_{t+1}(ã_t)、ã_t、V̂_{t+1}
+        state_preds, action_preds, curr_score_preds, _, curr_score_preds_1, action_1, value_preds = self.forward(
             states, actions, rewards, curr_score[:, :-1], timesteps, attention_mask=attention_mask,
         )
+        # ③ 只保留非 pad  token（attention_mask=1 才有效）
+        # â_t
         act_dim = action_preds.shape[2]
         action_preds = action_preds.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]
         action_target = action_target.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]
+        # ã_t
         action_1 = action_1.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]
-        action_1_frozen = action_1.clone().detach()
+        action_1_frozen = action_1.clone().detach()     # 探索动作 ã_t（梯度冻结）
+        # s^_t
         state_dim = state_preds.shape[2]
         state_preds = state_preds.reshape(-1, state_dim)[attention_mask.reshape(-1) > 0]
         state_target = state_target.reshape(-1, state_dim)[attention_mask.reshape(-1) > 0]
+        # r̂_{t+1}(a_t)
         curr_score_dim = curr_score_preds.shape[2]
         curr_score_preds = curr_score_preds.reshape(-1, curr_score_dim)[attention_mask.reshape(-1) > 0]
+        # r̂_{t+1}(ã_t)
         curr_score_preds_1 = curr_score_preds_1.reshape(-1, curr_score_dim)[attention_mask.reshape(-1) > 0]
         curr_score_target = curr_score_target.reshape(-1, curr_score_dim)[attention_mask.reshape(-1) > 0]
+        # V̂_{t+1}
         value_preds = value_preds.reshape(-1, curr_score_dim)[attention_mask.reshape(-1) > 0]
-        value_preds_frozen = value_preds.clone().detach()
+        value_preds_frozen = value_preds.clone().detach()    # V̂_{t+1}（梯度冻结）
 
         # Loss function without learnable value function. It's more stable but may perform worse than a finetuned loss with learnable value function.
         # In this case, we simply boost exploration by maxmaizing curr_score_preds_1 in wo.
@@ -360,21 +378,27 @@ class GAVE(nn.Module):
         # loss = loss1+loss2+loss3
 
         # The loss in the paper. It's param sensitive and need careful param selection.
+
+        # ④ 探索权重 w_t
+        # wo ≡ w_t = sigmoid( α · (r̂_{t+1}(ã_t) - r̂_{t+1}(a_t)) )
         wo = torch.sigmoid(100 * (curr_score_preds_1 - curr_score_preds))
         wo_frozen = wo.clone().detach()
+        # ⑤ expectile 权重（论文 3.4，τ=0.99）
         diff = curr_score_target - value_preds
         weight = torch.where(diff > 0, self.expectile, (1 - self.expectile))
         loss1 = torch.mean((1 - wo_frozen) * ((action_preds - action_target) ** 2) +
-                           wo_frozen * ((action_preds - action_1_frozen) ** 2))
-        loss2 = torch.mean((curr_score_preds - curr_score_target) ** 2) * 200
-        loss3 = torch.mean(weight * (diff ** 2)) * 100
-        loss4 = torch.mean((curr_score_preds_1 - value_preds_frozen) ** 2) * 100
+                           wo_frozen * ((action_preds - action_1_frozen) ** 2))     # 动作回归 + 探索偏向：用ã_t和a_t去训练â_t
+        loss2 = torch.mean((curr_score_preds - curr_score_target) ** 2) * 200       # 用真Rt+1训练预测的Rt+1
+        loss3 = torch.mean(weight * (diff ** 2)) * 100                              # 分位数上界回归，用Rt+1的分位数去训练Vt+1
+        loss4 = torch.mean((curr_score_preds_1 - value_preds_frozen) ** 2) * 100    # 探索动作对应的r̂_{t+1}(ã_t) 向 V̂ 靠拢（OOD 正则）
         loss = loss1 + loss2 + loss3 + loss4
         
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), .25)
         self.optimizer.step()
+
+        # 监控
         return (loss.detach().cpu().item(), loss1.detach().cpu().item(), loss2.detach().cpu().item(), loss3.detach().cpu().item(),
                 loss4.detach().cpu().item(), torch.mean(wo_frozen.squeeze()).cpu().item(), torch.mean(curr_score_target).cpu().item(),
                 torch.mean(curr_score_preds).cpu().item(), torch.mean(curr_score_preds_1).cpu().item())

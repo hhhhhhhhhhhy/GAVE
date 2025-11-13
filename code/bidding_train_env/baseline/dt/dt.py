@@ -21,7 +21,7 @@ def getScore(budget, cpa_cons, states, all_reward):
     '''
     gamma = 2
     curr_cost = budget * (1 - states[1])    # 已花预算 = 总预算 * (1-剩余比例)
-    curr_all_reward = all_reward        # 价值总和，rw = sun(xivi)
+    curr_all_reward = all_reward        # 价值总和，rw = sum(xivi)
     curr_cpa = curr_cost / (curr_all_reward + 1e-10)    # 当前CPA
     curr_coef = cpa_cons / (curr_cpa + 1e-10)   #
     curr_penalty = pow(curr_coef, gamma)    # 惩罚系数
